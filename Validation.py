@@ -138,7 +138,7 @@ for Interpolator in Interpolation_Method_List:
     
     # Loop through each HP model
     for HP_Model in List_HP_Models:
-        DSV = pd.read_excel('HP_Data.xlsx', sheet_name=HP_Model)
+        DSV = pd.read_excel('Heat_Pump_Data_F.xlsx', sheet_name=HP_Model)
         Capacity = RBFInterpolator(
             np.column_stack((DSV['OAT'], DSV['LWT'])), DSV['HC'], kernel=Interpolator, smoothing=0.0
         )
