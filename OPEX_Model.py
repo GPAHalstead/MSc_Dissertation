@@ -245,3 +245,169 @@ for col, title in [('Percent_OPEX_Difference', 'OPEX'), ('Percent_Power_Differen
 # Persist results to GeoJSON with filename describing the comparison and tariffs
 #tag = f"{Heat_Pump_1}_{Tariff_1}_vs_{Heat_Pump_2}_{Tariff_2}"
 #gdf.to_file(f"{tag}.geojson", driver='GeoJSON')
+
+#%% COP calculation for single refrigerant across the UK
+
+import numpy as np
+import geopandas as gpd
+from shapely.geometry import Point
+import pandas as pd
+from netCDF4 import Dataset
+from scipy.interpolate import RBFInterpolator
+
+# Defining Heat Pump and Tariff data file names
+File = 'Heat_Pump_Data_F.xlsx'   # workbook with performance maps + SPLCF
+Months = ['OCT_2024','NOV_2024','DEC_2024','JAN_2025','FEB_2025','MAR_2025','APR_2025']
+NC_Template = 'UK_T_{m}.nc'      # NetCDFs with variables: latitude, longitude, t2m
+UK_Shape_Geo = 'united_kingdom.geojson'  # polygon of UK
+
+# User defined Grid Resolution
+Resolution = 1  # geospatial calculation resolution (deg)
+
+# User defined Test Conditions
+T_cutoff = 16.0     # °C: no space heating demand above this
+Q_design = 9.0      # kW: design load
+Op_Mode  = 'On_Off_Cd_0.9'  # SPLCF column name
+Eff_SH   = 0.99     # auxiliary/resistive efficiency
+
+# User defined Refrigerant
+Refrigerant = 'P-AHP-410-9'
+
+# Quasi-Static Heat Pump Model
+# Full load Heat Capacity function
+def Q_FL(T_OA, T_LW):
+    T_LW = max(min(T_LW, T_LW_max), T_LW_min)
+    return float(Capacity(np.array([[T_OA, T_LW]])).item())
+
+# Full load Power consumption function
+def P_FL(T_OA, T_LW):
+    T_LW = max(min(T_LW, T_LW_max), T_LW_min)
+    return float(Power(np.array([[T_OA, T_LW]])).item())
+
+# Total Power Consumption
+def PI(T_OA, T_bivalent, Op_Mode, Eff_SH):
+    # Weather-compensated LWT curve with cap at 55°C
+    T_LW = min(55 + (-30 / (16 - T_bivalent)) * (T_OA - T_bivalent), 55)
+    if T_OA_min <= T_OA <= T_cutoff:
+        # Requested part-load ratio
+        PLR = (Q_design / Q_FL(T_OA, T_LW)) * ((T_cutoff - T_OA) / (T_cutoff - T_bivalent))
+        if 0 < PLR <= 1:
+            COP_FL = Q_FL(T_OA, T_LW) / P_FL(T_OA, T_LW)
+            Cd = np.interp(PLR, SPLCF['Part_Load'], SPLCF[Op_Mode])
+            return (Q_FL(T_OA, T_LW) * PLR) / (Cd * COP_FL), Q_FL(T_OA, T_LW) * PLR
+        elif PLR > 1:
+            return ((PLR - 1) * Q_FL(T_OA, T_LW) / Eff_SH) + P_FL(T_OA, T_LW), PLR * Q_FL(T_OA, T_LW)
+        else:
+            return 0, 0
+    elif T_OA < T_OA_min:
+        PLR = (Q_design / Q_FL(T_OA, T_LW)) * ((T_cutoff - T_OA) / (T_cutoff - T_bivalent))
+        return PLR * Q_FL(T_bivalent, T_LW) / Eff_SH, PLR * Q_FL(T_bivalent, T_LW)
+    else:
+        return 0, 0
+
+# Load Temperature Datasets by month
+print("Loading temperature datasets…")
+datasets = [Dataset(NC_Template.format(m=m)) for m in Months]
+nc_lats = datasets[0].variables['latitude'][:]
+nc_lons = datasets[0].variables['longitude'][:]
+
+# Build array of hour-of-day indices (0–23 repeating) for every timestep
+Hours = []
+for ds in datasets:
+    n = ds.variables['t2m'].shape[0]
+    arr = (np.arange(n) % 24).astype(int)
+    Hours.append(arr)
+Hours = np.concatenate(Hours)
+
+# Load UK boundary and prepare geometry
+uk = gpd.read_file(UK_Shape_Geo).to_crs(4326)
+uk_shape = uk.unary_union.buffer(0)
+
+# Build coarse grid over UK bounding box
+step = Resolution
+grid_lats = np.arange(int(np.floor(uk_shape.bounds[1])), int(np.ceil(uk_shape.bounds[3])) + step, step)
+grid_lons = np.arange(int(np.floor(uk_shape.bounds[0])), int(np.ceil(uk_shape.bounds[2])) + step, step)
+
+# Filter grid points to only those inside the UK polygon and with valid temp data
+valid_points = []
+for lat in grid_lats:
+    for lon in grid_lons:
+        pt = Point(lon, lat)
+        if not uk_shape.contains(pt):
+            continue
+        lat_idx = np.abs(nc_lats - lat).argmin()
+        lon_idx = np.abs(nc_lons - lon).argmin()
+        ts = datasets[0].variables['t2m'][:, lat_idx, lon_idx]
+        if np.ma.is_masked(ts) and ts.mask.any():
+            continue
+        valid_points.append((lat, lon))
+
+print(f"Valid points: {len(valid_points)}")
+
+# Load Heat Pump performance maps
+print(f"Loading performance maps for {Refrigerant}…")
+df_hp = pd.read_excel(File, sheet_name=Refrigerant)
+df_hp[['OAT','LWT','HC','IP']] = df_hp[['OAT','LWT','HC','IP']].apply(pd.to_numeric, errors='coerce')
+
+Capacity = RBFInterpolator(np.column_stack((df_hp['OAT'], df_hp['LWT'])), df_hp['HC'])
+Power    = RBFInterpolator(np.column_stack((df_hp['OAT'], df_hp['LWT'])), df_hp['IP'])
+
+T_OA_min = float(df_hp['OAT_MIN'].iloc[0])
+T_LW_min = float(df_hp['LWT_MIN'].iloc[0])
+T_LW_max = float(df_hp['LWT_MAX'].iloc[0])
+
+# Load SPLCF correction table
+SPLCF = pd.read_excel(File, sheet_name='Standard_PL_Correction_Factors')
+
+# Per-location Seasonal COP
+Seasonal_COP = []
+Sum_Heat_kWh = []
+Sum_Power_kWh = []
+
+for idx, (lat, lon) in enumerate(valid_points):
+    if idx % max(1, len(valid_points)//10) == 0:
+        print(f"  progress: {idx/len(valid_points)*100:.1f}%")
+
+    lat_idx = np.abs(nc_lats - lat).argmin()
+    lon_idx = np.abs(nc_lons - lon).argmin()
+
+    # Concatenate temperatures from all months and convert to °C
+    T_series = np.concatenate([
+        ds.variables['t2m'][:, lat_idx, lon_idx].filled(np.nan) for ds in datasets
+    ])
+    T_C = T_series - 273.15
+
+    # Bivalent temperature from local climate (5th percentile)
+    T_bivalent = np.nanpercentile(T_series, 5) - 273.15
+
+    sum_P = 0.0
+    sum_Q = 0.0
+
+    # Loop through hourly temps and accumulate power and heat
+    for T, hr in zip(T_C, Hours):
+        if np.isnan(T):
+            continue
+        P, Q = PI(T, T_bivalent, Op_Mode, Eff_SH)
+        sum_P += max(P, 0.0)
+        sum_Q += max(Q, 0.0)
+
+    cop = np.nan if sum_P <= 0 else (sum_Q / sum_P)
+    Seasonal_COP.append(cop)
+    Sum_Heat_kWh.append(sum_Q)
+    Sum_Power_kWh.append(sum_P)
+
+# Save results to GeoJSON
+print("Saving GeoJSON…")
+gdf = gpd.GeoDataFrame(
+    {
+        'Seasonal_COP': Seasonal_COP,
+        'Sum_Heat_kWh': Sum_Heat_kWh,
+        'Sum_Power_kWh': Sum_Power_kWh,
+    },
+    geometry=[Point(lon, lat) for lat, lon in valid_points],
+    crs='EPSG:4326'
+)
+
+tag = f"{Refrigerant}_Seasonal_COP"
+gdf.to_file(f"{tag}.geojson", driver='GeoJSON')
+print(f"Saved: {tag}.geojson")
