@@ -262,7 +262,7 @@ def PI(OAT, LWT, HC, Op_Mode, Eff_SH):
     CF = np.interp(PLR, SPLCF['Part_Load'], SPLCF[Op_Mode])
     return (HC_FL(OAT, LWT) * PLR) / (CF * COP_FL)
 
-SPLCF = pd.read_excel('HP_Data.xlsx', sheet_name='Standard_PL_Correction_Factors')
+SPLCF = pd.read_excel('Heat_Pump_Data_F.xlsx', sheet_name='Standard_PL_Correction_Factors')
 
 # Define the column headings for the summary
 columns = [
@@ -383,7 +383,7 @@ PLR_List = []
 PWR_List = []
 
 for HP_Model in List_HP_Models:
-    DSV = pd.read_excel('HP_Data.xlsx', sheet_name=HP_Model)
+    DSV = pd.read_excel('Heat_Pump_Data_F.xlsx', sheet_name=HP_Model)
 
     # Prepare regression inputs
     OAT_raw = DSV['OAT'].to_numpy()
